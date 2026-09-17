@@ -5,6 +5,9 @@ import os
 import datetime
 from PIL import Image
 
+# Google OR-Tools CP-SAT Constraint Engine
+from ortools.sat.python import cp_model
+
 # ==========================================
 # 1. DATABASE INITIALIZATION & UTILITIES
 # ==========================================
@@ -47,8 +50,18 @@ def init_production_db():
             time_start TEXT NOT NULL,
             time_end TEXT NOT NULL,
             room TEXT NOT NULL,
-            teacher_code TEXT UNIQUE NOT NULL,
-            section_code TEXT UNIQUE NOT NULL
+            teacher_code TEXT NOT NULL,
+            section_code TEXT NOT NULL
+        )
+    ''')
+
+    # Teacher Preferences Table (For AI Optimization Engine)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS teacher_preferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_username TEXT UNIQUE NOT NULL,
+            preferred_days TEXT NOT NULL,
+            preferred_timeslot TEXT NOT NULL
         )
     ''')
 
@@ -121,7 +134,145 @@ if not os.path.exists("attendance_photos"):
 
 
 # ==========================================
-# 2. DESIGN SYSTEM MATCHING SCREENSHOT UI
+# 2. AI CONSTRAINT-BASED SCHEDULER ENGINE
+# ==========================================
+TIME_SLOTS = [
+    ("08:00 AM", "10:00 AM", "Morning"),
+    ("10:00 AM", "12:00 PM", "Morning"),
+    ("01:00 PM", "03:00 PM", "Afternoon"),
+    ("03:00 PM", "05:00 PM", "Afternoon"),
+    ("05:00 PM", "07:00 PM", "Evening")
+]
+
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+
+def solve_ai_schedule(course_requests, available_rooms, teacher_prefs):
+    """
+    Uses Google OR-Tools CP-SAT Solver to generate an optimal, conflict-free schedule.
+    Hard Constraints:
+      - No teacher can teach two classes at the same time slot.
+      - No room can host two classes at the same time slot.
+      - No student section/program cohort can be in two classes simultaneously.
+    Soft Constraints (Optimized via Objective Score):
+      - Maximize teacher day and time slot preferences.
+    """
+    model = cp_model.CpModel()
+    assignments = {}
+
+    num_slots = len(TIME_SLOTS)
+    num_days = len(DAYS)
+    num_rooms = len(available_rooms)
+
+    # Decision Variables: assign[c, d, t, r] = 1 if course c is assigned to day d, slot t, room r
+    for c_idx, course in enumerate(course_requests):
+        for d_idx in range(num_days):
+            for t_idx in range(num_slots):
+                for r_idx in range(num_rooms):
+                    var_name = f"c{c_idx}_d{d_idx}_t{t_idx}_r{r_idx}"
+                    assignments[(c_idx, d_idx, t_idx, r_idx)] = model.NewBoolVar(var_name)
+
+    # Constraint 1: Each course must be scheduled exactly once
+    for c_idx in range(len(course_requests)):
+        model.AddExactlyOne(
+            assignments[(c_idx, d_idx, t_idx, r_idx)]
+            for d_idx in range(num_days)
+            for t_idx in range(num_slots)
+            for r_idx in range(num_rooms)
+        )
+
+    # Constraint 2: No teacher double-booking
+    for d_idx in range(num_days):
+        for t_idx in range(num_slots):
+            for teacher in set(c["teacher_username"] for c in course_requests):
+                t_courses = [i for i, c in enumerate(course_requests) if c["teacher_username"] == teacher]
+                model.Add(
+                    sum(assignments[(c_idx, d_idx, t_idx, r_idx)] 
+                        for c_idx in t_courses 
+                        for r_idx in range(num_rooms)) <= 1
+                )
+
+    # Constraint 3: No room double-booking
+    for d_idx in range(num_days):
+        for t_idx in range(num_slots):
+            for r_idx in range(num_rooms):
+                model.Add(
+                    sum(assignments[(c_idx, d_idx, t_idx, r_idx)] 
+                        for c_idx in range(len(course_requests))) <= 1
+                )
+
+    # Constraint 4: No student section cohort double-booking
+    for d_idx in range(num_days):
+        for t_idx in range(num_slots):
+            for sec in set((c["program"], c["year_level"]) for c in course_requests):
+                s_courses = [i for i, c in enumerate(course_requests) if (c["program"], c["year_level"]) == sec]
+                model.Add(
+                    sum(assignments[(c_idx, d_idx, t_idx, r_idx)] 
+                        for c_idx in s_courses 
+                        for r_idx in range(num_rooms)) <= 1
+                )
+
+    # Soft Constraint Objective: Teacher Preference Maximization
+    objective_terms = []
+    for c_idx, course in enumerate(course_requests):
+        t_uname = course["teacher_username"]
+        prefs = teacher_prefs.get(t_uname, {"days": DAYS, "timeslot": "Any"})
+        
+        pref_days = prefs["days"]
+        pref_slot_cat = prefs["timeslot"]
+
+        for d_idx, day_str in enumerate(DAYS):
+            for t_idx, slot in enumerate(TIME_SLOTS):
+                for r_idx in range(num_rooms):
+                    score = 0
+                    if day_str in pref_days:
+                        score += 10
+                    if pref_slot_cat != "Any" and slot[2] == pref_slot_cat:
+                        score += 15
+                    
+                    if score > 0:
+                        objective_terms.append(score * assignments[(c_idx, d_idx, t_idx, r_idx)])
+
+    if objective_terms:
+        model.Maximize(sum(objective_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 10.0
+    status = solver.Solve(model)
+
+    generated_schedule = []
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        for c_idx, course in enumerate(course_requests):
+            for d_idx, day_str in enumerate(DAYS):
+                for t_idx, slot in enumerate(TIME_SLOTS):
+                    for r_idx, room_str in enumerate(available_rooms):
+                        if solver.Value(assignments[(c_idx, d_idx, t_idx, r_idx)]) == 1:
+                            clean_subj = course["subject_code"].replace(" ", "").upper()
+                            clean_prof = "".join([w[0] for w in course["teacher_name"].split()]).upper()
+                            
+                            tch_code = f"TCH-{clean_prof}-{clean_subj}"
+                            stu_code = f"STU-{course['program'].replace(' ', '')}-{clean_subj}"
+
+                            generated_schedule.append({
+                                "teacher_name": course["teacher_name"],
+                                "teacher_username": course["teacher_username"],
+                                "subject_code": course["subject_code"],
+                                "subject_name": course["subject_name"],
+                                "program": course["program"],
+                                "year_level": course["year_level"],
+                                "day": day_str,
+                                "time_start": slot[0],
+                                "time_end": slot[1],
+                                "room": room_str,
+                                "teacher_code": tch_code,
+                                "section_code": stu_code
+                            })
+        return generated_schedule, "Success"
+    else:
+        return None, "Infeasible constraint combination. Try adding more rooms or time slots."
+
+
+# ==========================================
+# 3. DESIGN SYSTEM & UI STYLES
 # ==========================================
 def apply_custom_styles():
     st.markdown("""
@@ -132,13 +283,11 @@ def apply_custom_styles():
             font-family: 'Plus Jakarta Sans', sans-serif !important;
         }
 
-        /* Light Dashboard Background */
         .stApp {
             background-color: #F8FAFC !important;
             color: #0F172A !important;
         }
         
-        /* Dark Sidebar Override */
         [data-testid="stSidebar"] {
             background-color: #0A121E !important;
             border-right: 1px solid #1E293B !important;
@@ -150,7 +299,6 @@ def apply_custom_styles():
             color: #FFFFFF !important;
         }
         
-        /* Sidebar Radio Navigation Override */
         div[data-testid="stSidebarUserContent"] div[role="radiogroup"] > label {
             background-color: transparent !important;
             padding: 12px 16px !important;
@@ -166,7 +314,6 @@ def apply_custom_styles():
             font-weight: 700 !important;
         }
 
-        /* Hero Card for Auth Page */
         .opti-hero-card {
             background-color: #0A121E !important;
             padding: 40px;
@@ -175,7 +322,6 @@ def apply_custom_styles():
             box-shadow: 0 10px 30px rgba(9, 18, 30, 0.15);
         }
 
-        /* White Dashboard Section Card */
         .sched-section-card {
             background-color: #FFFFFF !important;
             padding: 24px;
@@ -208,7 +354,6 @@ def apply_custom_styles():
             border-radius: 12px;
         }
 
-        /* Subject Code Pill Badge */
         .subject-pill {
             background-color: #F1F5F9;
             color: #475569;
@@ -220,7 +365,6 @@ def apply_custom_styles():
             display: inline-block;
         }
 
-        /* Table Column Headers */
         .grid-header {
             font-size: 11px;
             font-weight: 800;
@@ -232,17 +376,6 @@ def apply_custom_styles():
             margin-bottom: 12px;
         }
 
-        /* Table Row Styling */
-        .grid-row {
-            padding: 12px 0;
-            border-bottom: 1px solid #F8FAFC;
-            display: flex;
-            align-items: center;
-            font-size: 14px;
-            color: #334155;
-        }
-
-        /* Primary Black Button (+ Add Schedule) */
         div.stButton > button[kind="primary"] {
             background-color: #0F172A !important;
             color: #FFFFFF !important;
@@ -253,7 +386,6 @@ def apply_custom_styles():
             padding: 0 20px !important;
         }
 
-        /* Inputs & Form Controls */
         div[data-baseweb="input"] > div, div[data-baseweb="select"] > div {
             background-color: #FFFFFF !important;
             color: #0F172A !important;
@@ -271,7 +403,6 @@ def apply_custom_styles():
 
 def render_sidebar():
     with st.sidebar:
-        # Header Logo & Title
         st.markdown("""
         <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 32px; padding: 0 8px;">
             <div style="background-color: #00B4D8; width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-weight: bold; color: #0A121E; font-size: 18px;">🗓️</div>
@@ -282,8 +413,8 @@ def render_sidebar():
         </div>
         """, unsafe_allow_html=True)
 
-        # Navigation Menu
         view = st.radio("Navigation", [
+            "🤖  AI Schedule Generator",
             "🗓️  Schedule Builder", 
             "🔑  Code Generation", 
             "📋  Attendance Records",
@@ -293,7 +424,6 @@ def render_sidebar():
         st.markdown("<br/><br/><br/>", unsafe_allow_html=True)
         st.write("---")
 
-        # Bottom Profile Avatar Block (Dr. Maria Santos)
         user_name = st.session_state.get('full_name', 'Dr. Maria Santos')
         first_letter = user_name[0] if user_name else 'D'
         st.markdown(f"""
@@ -313,7 +443,7 @@ def render_sidebar():
 
 
 # ==========================================
-# 3. AUTHENTICATION MODULE
+# 4. AUTHENTICATION MODULE
 # ==========================================
 def render_authentication():
     col_hero, col_form = st.columns([1.1, 0.9], gap="large")
@@ -334,13 +464,13 @@ def render_authentication():
         Scheduling.
     </h1>
     <p style="color: #94A3B8; font-size: 15px; line-height: 1.6; margin-bottom: 48px; max-width: 90%;">
-        Automated scheduling, faculty load monitoring, attendance tracking, and room optimization — all in one platform.
+        Automated constraint scheduling, faculty preferences, attendance tracking, and room optimization — all in one platform.
     </p>
     <ul style="list-style: none; padding: 0; margin: 0; color: #CBD5E1; font-size: 15px; line-height: 2.4; font-weight: 500;">
+        <li style="display: flex; align-items: center; gap: 10px;">🤖 AI CP-SAT Constraint Optimization</li>
         <li style="display: flex; align-items: center; gap: 10px;">📋 Conflict-free schedule generation</li>
         <li style="display: flex; align-items: center; gap: 10px;">🔑 Secure class code system</li>
         <li style="display: flex; align-items: center; gap: 10px;">📷 Photo-verified attendance</li>
-        <li style="display: flex; align-items: center; gap: 10px;">📊 Real-time faculty & student records</li>
     </ul>
 </div>
 """
@@ -406,7 +536,7 @@ def render_authentication():
 
 
 # ==========================================
-# 4. PROGRAM HEAD DASHBOARD MODULE (EXACT DESIGN)
+# 5. PROGRAM HEAD DASHBOARD MODULE
 # ==========================================
 def check_schedule_conflict(teacher_name, room, day, time_start, time_end, exclude_id=None):
     conn = get_db_connection()
@@ -429,8 +559,142 @@ def check_schedule_conflict(teacher_name, room, day, time_start, time_end, exclu
 def render_program_head_dashboard():
     view = render_sidebar()
 
-    if "🗓️  Schedule Builder" in view:
-        # Top Title Bar with + Add Schedule Button
+    if "🤖  AI Schedule Generator" in view:
+        st.markdown("<h1 style='font-size: 28px; font-weight: 800; margin: 0;'>🤖 AI Constraint Optimization Engine</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='color: #64748B; font-size: 14px; margin-top: 4px;'>Automatically generate conflict-free schedules while maximizing teacher availability preferences.</p>", unsafe_allow_html=True)
+        st.markdown("<br/>", unsafe_allow_html=True)
+
+        col_setup, col_preview = st.columns([1, 1], gap="large")
+
+        with col_setup:
+            st.markdown("""
+            <div class="sched-section-card">
+                <h3>1. Available Physical Facilities</h3>
+                <p style="color: #64748B; font-size: 13px;">Define rooms available for AI assignment:</p>
+            </div>
+            """, unsafe_allow_html=True)
+            rooms_str = st.text_area("Rooms (comma-separated)", "Room 101, Room 102, Lab 1, Lab 2", height=80)
+            rooms_list = [r.strip() for r in rooms_str.split(",") if r.strip()]
+
+            st.markdown("<br/>", unsafe_allow_html=True)
+
+            st.markdown("""
+            <div class="sched-section-card">
+                <h3>2. Unassigned Course Load Batch</h3>
+                <p style="color: #64748B; font-size: 13px;">Add courses requiring automated scheduling:</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if "ai_course_queue" not in st.session_state:
+                st.session_state["ai_course_queue"] = [
+                    {"teacher_name": "Prof. Branzuela", "teacher_username": "jbranzuela", "subject_code": "CC101", "subject_name": "Programming 1", "program": "BS CS", "year_level": "1"},
+                    {"teacher_name": "Prof. Branzuela", "teacher_username": "jbranzuela", "subject_code": "CC102", "subject_name": "Data Structures", "program": "BS CS", "year_level": "2"},
+                    {"teacher_name": "Dr. Maria Santos", "teacher_username": "msantos", "subject_code": "IT201", "subject_name": "Database Systems", "program": "BS IT", "year_level": "2"}
+                ]
+
+            with st.form("add_course_batch"):
+                conn = get_db_connection()
+                teachers = conn.execute("SELECT username, full_name FROM users WHERE role = 'Teacher'").fetchall()
+                conn.close()
+                
+                t_options = {t["full_name"]: t["username"] for t in teachers} if teachers else {"Prof. Branzuela": "jbranzuela"}
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    t_name = st.selectbox("Assign Faculty", list(t_options.keys()))
+                    subj_c = st.text_input("Subject Code", "CS301")
+                    subj_n = st.text_input("Subject Name", "Algorithms")
+                with c2:
+                    prog = st.selectbox("Program", ["BS CS", "BS IT", "BS ED"])
+                    y_lvl = st.selectbox("Year Level", ["1", "2", "3", "4"])
+
+                if st.form_submit_button("+ Add to Queue", type="primary"):
+                    st.session_state["ai_course_queue"].append({
+                        "teacher_name": t_name,
+                        "teacher_username": t_options[t_name],
+                        "subject_code": subj_c,
+                        "subject_name": subj_n,
+                        "program": prog,
+                        "year_level": y_lvl
+                    })
+                    st.success("Added to course queue!")
+
+        with col_preview:
+            st.markdown("""
+            <div class="sched-section-card">
+                <h3>3. Course Queue ({})</h3>
+            </div>
+            """.format(len(st.session_state["ai_course_queue"])), unsafe_allow_html=True)
+
+            for idx, q in enumerate(st.session_state["ai_course_queue"]):
+                c_del, c_info = st.columns([0.15, 0.85])
+                with c_del:
+                    if st.button("❌", key=f"q_del_{idx}"):
+                        st.session_state["ai_course_queue"].pop(idx)
+                        st.rerun()
+                with c_info:
+                    st.markdown(f"**{q['subject_code']}** - {q['subject_name']} | **Faculty:** {q['teacher_name']} ({q['program']} {q['year_level']})")
+
+            st.markdown("<br/>", unsafe_allow_html=True)
+            
+            if st.button("⚡ Run AI Schedule Solver", type="primary", use_container_width=True):
+                if not st.session_state["ai_course_queue"]:
+                    st.error("Please add courses to the queue first.")
+                elif not rooms_list:
+                    st.error("Please specify at least one room.")
+                else:
+                    conn = get_db_connection()
+                    prefs_raw = conn.execute("SELECT * FROM teacher_preferences").fetchall()
+                    conn.close()
+
+                    teacher_prefs = {}
+                    for p in prefs_raw:
+                        teacher_prefs[p["teacher_username"]] = {
+                            "days": p["preferred_days"].split(","),
+                            "timeslot": p["preferred_timeslot"]
+                        }
+
+                    with st.spinner("AI Engine calculating optimal non-conflicting schedule..."):
+                        gen_sched, status = solve_ai_schedule(
+                            st.session_state["ai_course_queue"], 
+                            rooms_list, 
+                            teacher_prefs
+                        )
+
+                    if gen_sched:
+                        st.session_state["preview_generated_schedule"] = gen_sched
+                        st.success(f"AI Optimization Complete! Found {len(gen_sched)} conflict-free slots.")
+                    else:
+                        st.error(f"AI Solver Failed: {status}")
+
+        if "preview_generated_schedule" in st.session_state and st.session_state["preview_generated_schedule"]:
+            st.markdown("<br/><h3>Preview AI Suggested Schedule</h3>", unsafe_allow_html=True)
+            
+            preview_data = st.session_state["preview_generated_schedule"]
+            st.dataframe(preview_data, use_container_width=True)
+
+            if st.button("💾 Apply & Publish Generated Schedule to Database", type="primary"):
+                conn = get_db_connection()
+                for item in preview_data:
+                    conn.execute("""
+                        INSERT INTO schedules (
+                            teacher_name, teacher_username, subject_code, subject_name, 
+                            program, year_level, day, time_start, time_end, room, teacher_code, section_code
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        item["teacher_name"], item["teacher_username"], item["subject_code"],
+                        item["subject_name"], item["program"], item["year_level"],
+                        item["day"], item["time_start"], item["time_end"],
+                        item["room"], item["teacher_code"], item["section_code"]
+                    ))
+                conn.commit()
+                conn.close()
+                st.session_state["preview_generated_schedule"] = []
+                st.session_state["ai_course_queue"] = []
+                st.success("All AI generated schedules successfully saved and published!")
+                st.rerun()
+
+    elif "🗓️  Schedule Builder" in view:
         col_title, col_btn = st.columns([3, 1])
         with col_title:
             st.markdown("<h1 style='font-size: 28px; font-weight: 800; margin: 0;'>Schedule Builder</h1>", unsafe_allow_html=True)
@@ -441,7 +705,6 @@ def render_program_head_dashboard():
 
         st.markdown("<br/>", unsafe_allow_html=True)
 
-        # Modal/Expander for Schedule Input
         if show_add_modal or st.session_state.get("show_add_form", False):
             st.session_state["show_add_form"] = True
             with st.expander("➕ Add New Schedule Entry", expanded=True):
@@ -452,7 +715,7 @@ def render_program_head_dashboard():
                         teacher_username = st.text_input("Teacher Username")
                         subject_code = st.text_input("Subject Code (e.g. CC101)")
                         subject_name = st.text_input("Subject Name (e.g. Programming)")
-                        program = st.selectbox("Program", ["BS BSCS", "BS IT", "BS ED"])
+                        program = st.selectbox("Program", ["BS CS", "BS IT", "BS ED"])
                     with c2:
                         year_level = st.selectbox("Section / Year", ["1", "2", "3", "4"])
                         day = st.selectbox("Day", ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"])
@@ -491,13 +754,11 @@ def render_program_head_dashboard():
                                 st.session_state["show_add_form"] = False
                                 st.rerun()
 
-        # Query and Group Schedules by Program & Section Card (Matching Image)
         conn = get_db_connection()
         schedules = conn.execute("SELECT * FROM schedules ORDER BY program, year_level, id").fetchall()
         conn.close()
 
         if schedules:
-            # Group by section tag (e.g., "BS BSCS 1")
             sections = {}
             for s in schedules:
                 sec_key = f"{s['program']} {s['year_level']}"
@@ -515,7 +776,6 @@ def render_program_head_dashboard():
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Render Grid Table Header
                 col1, col2, col3, col4, col5, col6, col7 = st.columns([2.2, 1, 2.2, 1.5, 2.5, 1.5, 0.5])
                 with col1: st.markdown("<div class='grid-header'>TEACHER</div>", unsafe_allow_html=True)
                 with col2: st.markdown("<div class='grid-header'>DAY</div>", unsafe_allow_html=True)
@@ -525,7 +785,6 @@ def render_program_head_dashboard():
                 with col6: st.markdown("<div class='grid-header'>ROOM</div>", unsafe_allow_html=True)
                 with col7: st.markdown("<div class='grid-header'></div>", unsafe_allow_html=True)
 
-                # Render Grid Table Rows
                 for item in items:
                     r1, r2, r3, r4, r5, r6, r7 = st.columns([2.2, 1, 2.2, 1.5, 2.5, 1.5, 0.5])
                     with r1: st.markdown(f"**{item['teacher_name']}**")
@@ -543,7 +802,7 @@ def render_program_head_dashboard():
                             st.rerun()
                 st.markdown("<br/>", unsafe_allow_html=True)
         else:
-            st.info("No master schedules generated yet. Click '+ Add Schedule' to create your first entry.")
+            st.info("No master schedules generated yet. Click '+ Add Schedule' or use the '🤖 AI Schedule Generator'.")
 
     elif "🔑  Code Generation" in view:
         st.title("🔑 Role-Based Access Code Hub")
@@ -660,7 +919,7 @@ def render_program_head_dashboard():
 
 
 # ==========================================
-# 5. TEACHER PORTAL MODULE
+# 6. TEACHER PORTAL MODULE (WITH PREFERENCES)
 # ==========================================
 def render_teacher_portal():
     with st.sidebar:
@@ -668,13 +927,42 @@ def render_teacher_portal():
         st.markdown("**Role:** Teacher")
         st.write("---")
 
-    if st.sidebar.button("Sign Out"):
-        st.session_state.clear()
-        st.rerun()
+        if st.button("Sign Out", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
-    st.title("Teacher Course Workspace")
-    
-    with st.expander("🔑 Claim Class Schedule via Access Code", expanded=True):
+    st.title("Teacher Workspace & AI Availability Preferences")
+
+    # Teacher Schedule Preference Setting
+    with st.expander("⭐ Set Availability Preferences (For AI Schedule Generator)", expanded=True):
+        st.caption("The AI algorithm will prioritize scheduling your classes on your preferred days and time slots.")
+        
+        conn = get_db_connection()
+        curr_pref = conn.execute("SELECT * FROM teacher_preferences WHERE teacher_username = ?", (st.session_state["username"],)).fetchone()
+        conn.close()
+
+        default_days = curr_pref["preferred_days"].split(",") if curr_pref else ["Mon", "Wed", "Fri"]
+        default_slot = curr_pref["preferred_timeslot"] if curr_pref else "Morning"
+
+        pref_days = st.multiselect("Preferred Teaching Days", DAYS, default=default_days)
+        pref_slot = st.selectbox("Preferred Time Window", ["Morning", "Afternoon", "Evening", "Any"], index=["Morning", "Afternoon", "Evening", "Any"].index(default_slot))
+
+        if st.button("Save AI Preferences", type="primary"):
+            days_str = ",".join(pref_days)
+            conn = get_db_connection()
+            conn.execute("""
+                INSERT INTO teacher_preferences (teacher_username, preferred_days, preferred_timeslot)
+                VALUES (?, ?, ?)
+                ON CONFLICT(teacher_username) DO UPDATE SET
+                    preferred_days = excluded.preferred_days,
+                    preferred_timeslot = excluded.preferred_timeslot
+            """, (st.session_state["username"], days_str, pref_slot))
+            conn.commit()
+            conn.close()
+            st.success("AI preferences saved! The Program Head will be able to optimize your schedule.")
+
+    # Access Code Claim Section
+    with st.expander("🔑 Claim Class Schedule via Access Code", expanded=False):
         code_input = st.text_input("Enter Teacher Access Code (e.g., TCH-...)").strip()
         if st.button("Link Schedule", type="primary"):
             conn = get_db_connection()
@@ -784,7 +1072,7 @@ def render_teacher_portal():
 
 
 # ==========================================
-# 6. STUDENT PORTAL MODULE
+# 7. STUDENT PORTAL MODULE
 # ==========================================
 def render_student_portal():
     with st.sidebar:
@@ -792,9 +1080,9 @@ def render_student_portal():
         st.markdown("**Role:** Student")
         st.write("---")
 
-    if st.sidebar.button("Sign Out"):
-        st.session_state.clear()
-        st.rerun()
+        if st.button("Sign Out", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
 
     st.title("Student Class Portal")
 
@@ -869,7 +1157,7 @@ def render_student_portal():
 
 
 # ==========================================
-# 7. ROUTING CONTROLLER
+# 8. ROUTING CONTROLLER
 # ==========================================
 def main():
     st.set_page_config(
